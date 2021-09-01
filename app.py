@@ -14,6 +14,7 @@ from flask import Blueprint
 
 import logging
 import pandas as pd
+import numpy as np
 import requests
 
 from sqlalchemy import create_engine
@@ -48,6 +49,7 @@ Session = sessionmaker()
 engine = create_engine('sqlite:///mydb.sqlite', echo=True, connect_args={"check_same_thread": False})
 Session.configure(bind=engine)
 
+
 # HEROKU os variables ------------------------------------------------------------------------------------
 #Endpoints
 entities_endpoint = os.environ['ENTITIES_ENDPOINT']
@@ -60,6 +62,7 @@ aws_access_key = os.environ['AWS_ACCESS_KEY']
 aws_secret_access_key = os.environ['AWS_SECRET_ACCESS_KEY']
 aws_region = os.environ['AWS_REGION']
 aws_service = os.environ['AWS_SERVICE']
+timeout_aws = int(os.environ['TIMEOUT_AWS']) # time out in sec
 
 app.config['SECRET_KEY'] = os.environ['SECRET_KEY']
 
@@ -85,8 +88,7 @@ convlog_aws_host = convlog_endpoint.split('/')[2]
 #     db.session.rollback()
 #     from .main import routes  # Import routes
 
-determinants = ['this', 'that', 'these', 'those', 'its', 'their', 'any', 'all', 'both', 'either', 'neither', 'each',
-                    'every', 'such', 'they', 'it']
+determinants = ['this', 'its', 'such', 'it']
 
 
 # DB Classes ------------------------------------------------------------------------
@@ -197,6 +199,9 @@ def get_intention():
     if not request.json or not 'sentence' in request.json:
         abort(400)
     sentence = request.json['sentence']
+
+    sentence = sentence.replace('amenities', 'facilities') # workaround missclassification amenities
+
     sentence_split = sentence.split()
     if 'userID' in request.json:
         userID = request.json['userID']
@@ -209,9 +214,28 @@ def get_intention():
     entities_old = []
     if 'entities_old' in request.json:
         entities_old = request.json['entities_old']
-
+    intention_type = ''
     if len(sentence.split()) < 3:
-        abort(400)
+        greeting_words = ['thank','hi','bye','morning','day', 'night', 'afternoon', 'hello']
+        for i in greeting_words:
+            if i in sentence.lower():
+                return jsonify({'intention': [], 'entities': [], 'aspect': '', 'intention_type': 'greeting'})
+        if intention_type == '':
+            return jsonify({'error_code': 101, 'error_description':'I am unable to find an answer, could you please try to rephrase your question?'})
+
+    if len(sentence.split()) < 7:
+        greeting_words = ['thank','hi','bye','morning','day', 'night', 'afternoon', 'hello']
+        closing_words = ['that', 'ok', 'done']
+        greeting = closing = False
+        for i in greeting_words:
+            if i in sentence.lower():
+                greeting = True
+        for i in closing_words:
+            if i in sentence.lower():
+                closing = True
+        if greeting & closing:
+            return jsonify({'intention': [], 'entities': [], 'aspect': '', 'intention_type': 'greeting'})
+
     # wooz_sentences = pd.read_csv('C:\Python\ConversationalRS\data\ConvQA1Sentences.csv', sep='\t')#to check accuracy on WoOz dataset
     # for i, row in wooz_sentences.iterrows(): #to check accuracy on WoOz dataset
     #     sentence = row['Question']
@@ -221,16 +245,18 @@ def get_intention():
         scope = assessment = detail = comparison = ""
 
         try:
-            # Pre processing: #TODO: splitting, lower upper case?
-            # greetings and thank you
 
             # Get intention_type.
             intention_type = 'domain' #TODO For now, only domain type is handled
             # Get entities
-            cities_dataset = ['amsterdam', 'barcelona', 'berlin', 'paris', 'san francisco', 'seattle', 'sydney', 'hong kong']
+            cities_dataset = ['amsterdam', 'barcelona', 'berlin', 'paris', 'san francisco', 'seattle', 'sydney', 'hong kong', 'hotel']
             auth = AWSRequestsAuth(aws_access_key=aws_access_key, aws_secret_access_key=aws_secret_access_key,
                                    aws_host=entities_aws_host,aws_region=aws_region, aws_service=aws_service)
-            response = requests.post(entities_endpoint,json={"sentence": sentence},auth=auth)
+            try:
+                response = requests.post(entities_endpoint,json={"sentence": sentence},auth=auth, timeout=timeout_aws)
+            except requests.Timeout:
+                response = requests.post(entities_endpoint, json={"sentence": sentence}, auth=auth, timeout=timeout_aws)
+
             if not response: #or not 'hotels' in request.json:
                 abort(400)
             if 'error' in response.json():
@@ -243,18 +269,22 @@ def get_intention():
                         error = "question_needs_clarification"
                         jsonify({'error': error})
                 for i in range(len(hotels)):
-                    if (hotels[i].lower() not in cities_dataset) & (hotels[i].lower() not in ['wifi']): # To solve issue of recognizing cities or word "wifi" as hotel names,
+                    if (hotels[i].lower() not in cities_dataset) & (hotels[i].lower() not in ['wifi']): # To solve issue of recognizing cities or word "wifi" or just word 'Hotel' as hotel names,
                         entities_new.append(hotels[i])
             # Get features
             #TODO
 
             # Get comparison
             comparison = ""
-            sentence = sentence.replace('?',
-                                        '')  # workaround, superlative questions are not recognized as superlative when question mark included.
+            # sentence = sentence.replace('?',
+            #                             '')  # workaround, superlative questions are not recognized as superlative when question mark included.
             auth = AWSRequestsAuth(aws_access_key=aws_access_key, aws_secret_access_key=aws_secret_access_key,
                                    aws_host=comparison_aws_host, aws_region=aws_region, aws_service=aws_service)
-            response = requests.post(comparison_endpoint, json={"sentence": sentence}, auth=auth)
+            try:
+                response = requests.post(comparison_endpoint, json={"sentence": sentence}, auth=auth, timeout=timeout_aws)
+            except requests.Timeout:
+                response = requests.post(comparison_endpoint, json={"sentence": sentence}, auth=auth, timeout=timeout_aws)
+                print("this one worked")
             if not response:  # or not 'hotels' in request.json:
                 abort(400)
             if 'error' in response.json():
@@ -263,14 +293,14 @@ def get_intention():
                 comparison = response.json().get("type")
             else:
                 comparison = "not_found"
-            if comparison == 'non_comparative':
-                if ("which" in sentence.lower()) & (("most" in sentence.lower()) | (
-                        "nearest" in sentence.lower())):  # Workaround, special cases not recognized as comparative
-                    comparison = "comparative"
+            # if comparison == 'non_comparative':
+            #     if ("which" in sentence.lower()) & (("most" in sentence.lower()) | (
+            #             "nearest" in sentence.lower())):  # Workaround, special cases not recognized as comparative
+            #         comparison = "comparative"
 
             # Get scope (possible values: Single, Tuple, Indefinite
             if len(entities_new) == 0:
-                if (any([i in sentence for i in determinants])) & (len(entities_old) > 0):
+                if (any([i in sentence.lower().split() for i in determinants])) & (len(entities_old) > 0):
                     entities_new = entities_old
                     if len(entities_old) == 1:
                         scope = 'single'
@@ -280,7 +310,7 @@ def get_intention():
                     scope = 'indefinite'
             elif len(entities_new) == 1:
                 scope = 'single'
-                if (comparison == 'comparative') & (any([i in sentence for i in determinants])) & (len(entities_old) > 0):
+                if (comparison == 'comparative') & (any([i in sentence.lower().split() for i in determinants])) & (len(entities_old) > 0):
                     scope = 'tuple'
                     entities_new.extend(entities_old)
             else:
@@ -289,38 +319,32 @@ def get_intention():
             # Get assessment
             assessment = ""
             sentence_split = sentence.split(" ")
-            if ('free' in sentence.lower()) | ('complimentary' in sentence.lower()):
-                assessment = "factoid"
-            elif ('how are' in sentence.lower()) | ('how is' in sentence.lower()):
-                assessment = "subjective"
+            auth = AWSRequestsAuth(aws_access_key=aws_access_key, aws_secret_access_key=aws_secret_access_key,
+                                   aws_host=subjective_aws_host,aws_region=aws_region, aws_service=aws_service)
+            sentence_aux = sentence
+            if '?' not in sentence_aux:
+                sentence_aux = sentence_aux + '?'
+            try:
+                response = requests.post(subjective_endpoint, json={"sentence": sentence_aux}, auth=auth, timeout=timeout_aws)
+            except requests.Timeout:
+                response = requests.post(subjective_endpoint, json={"sentence": sentence_aux}, auth=auth, timeout=timeout_aws)
+            if not response:  # or not 'hotels' in request.json:
+                abort(400)
+            if 'error' in response.json():
+                print("Error getting assessment:" + response.json().get("error"))
+            if 'type' in response.json():
+                assessment = response.json().get("type")
             else:
-                auth = AWSRequestsAuth(aws_access_key=aws_access_key, aws_secret_access_key=aws_secret_access_key,
-                                       aws_host=subjective_aws_host,aws_region=aws_region, aws_service=aws_service)
-                response = requests.post(subjective_endpoint, json={"sentence": sentence},auth=auth)
-                if not response:  # or not 'hotels' in request.json:
-                    abort(400)
-                if 'error' in response.json():
-                    print("Error getting assessment:" + response.json().get("error"))
-                if 'type' in response.json():
-                    type = response.json().get("type")
-                    if type == "non_subjective":
-                        assessment = "factoid"
-                    else:
-                        assessment = "subjective"
-                else:
-                    assessment = "not_found"
-            if "why" in sentence.lower():
-                assessment = "why-recommended"
-
-            # if comparative, by default assessment subjective
-            if (comparison == 'comparative') & (assessment == 'factoid'):
-                assessment = 'subjective'
+                assessment = "not_found"
 
             # Get Detail
             detail = ""
             auth = AWSRequestsAuth(aws_access_key=aws_access_key, aws_secret_access_key=aws_secret_access_key,
                                    aws_host=detail_aws_host,aws_region=aws_region, aws_service=aws_service)
-            response = requests.post(detail_endpoint, json={"sentence": sentence},auth=auth)
+            try:
+                response = requests.post(detail_endpoint, json={"sentence": sentence},auth=auth, timeout=timeout_aws)
+            except requests.Timeout:
+                response = requests.post(detail_endpoint, json={"sentence": sentence}, auth=auth, timeout=timeout_aws)
             if not response:  # or not 'hotels' in request.json:
                 abort(400)
             if 'error' in response.json():
@@ -334,7 +358,13 @@ def get_intention():
             if detail == 'aspect':
                 auth = AWSRequestsAuth(aws_access_key=aws_access_key, aws_secret_access_key=aws_secret_access_key,
                                        aws_host=aspect_aws_host, aws_region=aws_region, aws_service=aws_service)
-                response = requests.post(aspect_endpoint, json={"sentence": sentence + '?'}, auth=auth) # To solve missclassification when no question mark was sent, e.g. Which is the cheapest hotel?
+                sentence_aux = sentence
+                if '?' not in sentence_aux:
+                    sentence_aux = sentence_aux + '?'
+                try:
+                    response = requests.post(aspect_endpoint, json={"sentence": sentence_aux}, auth=auth, timeout=timeout_aws)
+                except requests.Timeout:
+                    response = requests.post(aspect_endpoint, json={"sentence": sentence_aux}, auth=auth, timeout=timeout_aws)
                 if not response:  # or not 'hotels' in request.json:
                     abort(400)
                 if 'error' in response.json():
@@ -348,8 +378,8 @@ def get_intention():
 
             entity1 = entity2 = aspect1 = aspect2 = "" #TODO: handle entities and aspects
 
-            # Special case: close location or cheap should not be understood as subjective in our context
-            if ((aspect == 'location') | (aspect == 'food')) and ('close' in sentence):
+            # Special case: close location or cheap should not be understood as evaluation in our context
+            if ((aspect == 'location') | (aspect == 'food')) and (('close' in sentence) | ('far' in sentence)) :
                 assessment = 'factoid'
                 comparison = 'non_comparative'
                 aspect = 'location' # closest to restaurants should be regarded as location, not food
@@ -357,7 +387,30 @@ def get_intention():
                 aspect = 'price'
             if (aspect == 'price') and ('cheap' in sentence):
                 assessment = 'factoid'
-            
+
+            if assessment == 'evaluation':
+                assessment = 'subjective'
+
+            # special case: when comparison uses 'above' or 'over', comparison is not detected
+            if (('above' in sentence.lower()) | ('over' in sentence.lower())) & (assessment != 'factoid') & (comparison == 'non_comparative'):
+                comparison = 'comparative'
+
+            # special case: questions of type what about
+            if 'what about hotel' in sentence.lower():
+                assessment = 'subjective'
+                detail = 'overall'
+
+            # special case: questions type "which of these recommend the most" that are classified as why
+            if (assessment == 'why-recommended') & (comparison == 'comparative') & (detail == 'overall') & (scope == 'indefinite') & ('which' in sentence.lower()):
+                assessment = 'subjective'
+
+            # special case: questions type "do you recommend"
+            if 'do you recommend hotel' in sentence.lower():
+                assessment = 'subjective'
+            # special case: questions type "do you recommend"
+            if 'more about hotel' in sentence.lower():
+                assessment = 'subjective'
+
             intention = [{'scope': scope, 'assessment': assessment, 'detail': detail, 'comparison': comparison}]
 
             #print(sentence + str(entities_new) + str(intention) + " " + str(aspect))
@@ -374,12 +427,12 @@ def get_intention():
                 traceback.print_exc()
         except Exception as e:
             print('Error Processing: ' + str(e))
-            traceback.print_exc()
+            #traceback.print_exc()
             intention=[]
 
     #TODO: handle not finding an intention
     if len(intention) == 0:
-       abort(404)
+        return jsonify({'error_code': 101, 'error_description': 'I am unable to find an answer, could you please try to rephrase your question?'})
     return jsonify({'intention': intention[0], 'entities': entities_new, 'aspect': aspect, 'intention_type': intention_type})
 
 @app.route('/ExplainableRS/GetReply/', methods=['GET'])
@@ -391,6 +444,7 @@ def get_reply():
     intention = request.json['intention']
     entities = request.json['entities']
     aspect = request.json['aspect']
+    intent_type = request.json['intention_type']
     aspects_reply = []
     entities_reply = []
 
@@ -398,13 +452,6 @@ def get_reply():
         userID = request.json['userID']
     else:
         userID = ''
-
-    sentence_split = sentence.lower().split()
-    scope = intention.get('scope')
-    assessment = intention.get('assessment')
-    detail = intention.get('detail')
-    comparison = intention.get('comparison')
-
     preferences = []
 
     reply = ""
@@ -449,7 +496,24 @@ def get_reply():
         error_code = 100
         raise ValueError('Error when getting similar user: ' + str(e))
 
+    if intent_type == 'greeting':
+        if 'thank' in sentence.lower():
+            reply = 'You are welcome.'
+        elif ('hi' in sentence.lower()) | ('hello' in sentence.lower()) | ('good' in sentence.lower()):
+            reply = 'Hi! You can write your question below.'
+        elif 'bye' in sentence.lower():
+            reply = 'Good bye!'
+        return jsonify({'reply': reply, 'similar_user': similar_user, 'feature': '', 'aspects_reply': [], 'entities_reply': []})
 
+
+    sentence_split = sentence.lower().split()
+    scope = intention.get('scope')
+    assessment = intention.get('assessment')
+    detail = intention.get('detail')
+    comparison = intention.get('comparison')
+
+    if assessment == 'subjective':
+        assessment = 'evaluation'
     # Get first 2 preferences from similar user:------------------------------------------------------------
     try:
         top_prefs = db.session.query(Preferences.pref_0, Preferences.pref_1).filter(Preferences.userID == similar_user).all()
@@ -476,9 +540,10 @@ def get_reply():
                         feature = i
 
                 # canned statements # TODO: Make more extensive lists
-                prices = {'room': '$84', 'food': '$12', 'price': '$40'}
+                prices = {'room': '$84', 'food': '$12', 'price': '$80'}
                 having = {'facilities': 'Pool, gym, rooms with balcony, restaurant and bar. ',
-                          'room': 'Single and double.'}
+                          'room': 'Single and double.',
+                          'breakfast': 'Continental breakfast.'}
                 where = ['Near the main square, the botanical garden and the main train station. ',
                          'Near the Art New Museum, St. John\'s Park and the south train station. ',
                          'Near the Museum of Modern Art, the main train station and the green square. ']
@@ -487,6 +552,12 @@ def get_reply():
                 rate = 'It is the 87%. '
                 check_time = 'Check-in after 14:00, check-out before 11:00.'
                 close = 'About 10 minutes walk.'
+                close_places_having = 'Yes, in the surroundings (walking distance) you will find many of them.'
+
+                # special case, "can you tell me the"
+                if 'can you tell me the' in sentence.lower():
+                    sentence = sentence.replace('can you tell me', 'what is the')
+                    sentence_split = sentence.lower().split()
 
                 question_w = sentence_split[0]
 
@@ -494,6 +565,15 @@ def get_reply():
                     if question_w == 'how' :
                         if sentence_split[1] in ['close', 'far']:
                             reply = close
+                    if question_w == 'is' : # e.g. is hotel henry close to any good restaurants
+                        if ('close' in sentence_split) | ('near' in sentence_split):
+                            if ('restaurant' in sentence.lower()) | ('attraction' in sentence.lower()):
+                                reply = close_places_having
+                            else:
+                                reply = 'Yes, it is.'
+                        else:
+                            reply = 'Yes, it is. '
+
                     elif question_w in ['what', 'where']:
                         reply = where[random.randint(0,2)]
                 else:
@@ -515,14 +595,20 @@ def get_reply():
                                 elif len(entities) > 2:
                                     reply = 'Yes, all of them'
                     elif question_w == 'how':
-                        if (sentence_split[1] == 'much') and (sentence_split[-1] == 'cost'):
+                        #if (sentence_split[1] == 'much') and (sentence_split[-1] == 'cost'):
+                        if ('much' in sentence.lower()) & ('cost' in sentence.lower()):
                             if prices.get(aspect) is not None:
                                 reply = prices.get(aspect) + ' in average'
                         if sentence_split[1] == 'old':
                             reply = old
+                        if ('many' in sentence.lower()) & ('stars' in sentence.lower()):
+                            reply = '4 stars. '
+                        if ('bed' in sentence.lower()) & (('size' in sentence.lower()) | ('type' in sentence.lower()) | ('many' in sentence.lower())):
+                            reply = "Double or twin bedded rooms. "
+
                     elif question_w in ['what', 'whats', 'when', 'what\'s']:
                         #if sentence_split[-1] in ['has', 'have']:
-                        if ('has' in sentence) | ('have' in sentence) | ((aspect == 'facilities') & ('are' in sentence)):
+                        if ('has' in sentence) | ('have' in sentence) | ('offer' in sentence) | ((aspect == 'facilities') & ('are' in sentence)):
                             if having.get(aspect) is not None:
                                 reply = having.get(aspect)
                         if (sentence_split[1] == 'is') | (question_w in ['whats', 'what\'s']):
@@ -530,8 +616,25 @@ def get_reply():
                                 reply = prices.get(aspect)
                             if 'rate' in sentence_split:
                                 reply = rate
+                            if (aspect == 'food') & (('breakfast' in sentence_split) | ('like' in sentence_split)):
+                                reply = having.get('breakfast')
+                            if ((aspect == 'room') | (aspect == 'price')) & ('included' in sentence_split):
+                                reply = 'The room includes double bed, minibar, desk and balcony. The price includes breakfast.'
+                        if (sentence_split[1] == 'is') | (question_w in ['whats', 'what\'s', 'what']):
+                            if (aspect == 'food') & (('breakfast' in sentence_split) | ('like' in sentence_split)):
+                                reply = having.get('breakfast')
+                            if ((aspect == 'room') | (aspect == 'price')) & ('included' in sentence_split):
+                                reply = 'The room includes double bed, minibar, desk and balcony. The price includes breakfast.'
+                            if (aspect == 'food') & (('menu' in sentence_split) | ('food' in sentence_split)):
+                                reply = 'Buffet, and fast food. Includes vegetarian and non-vegetarian options.'
                         if 'check' in sentence:
                             reply = check_time
+                        if ('many' in sentence.lower()) & ('stars' in sentence.lower()):
+                            reply = '4 stars. '
+                        if ('bed' in sentence.lower()) & (
+                                ('size' in sentence.lower()) | ('type' in sentence.lower()) | (
+                                'many' in sentence.lower())):
+                            reply = "Double or twin bedded rooms. "
                     elif question_w == 'when':
                         if sentence_split[1] == 'was':
                             reply = ago
@@ -605,6 +708,8 @@ def get_reply():
                                 error_code = 101
                 else:
                     error_code = 102
+                if (aspect == 'price') & ('expensive' in sentence.lower()): # special case reasons why so expensive
+                    reply = ''
             except Exception as e:
                 error_code = 100
                 raise ValueError('Error when getting reply intention Single - Why - Overall: ' + str(e))
@@ -615,6 +720,7 @@ def get_reply():
             # Templates
             header = "In regards to _asp0_, customers reported _per0_% positive comments about _hotel0_"
             extra = ", _per0_% about _hotel0_"
+            entities_reply = entities
             try:
                 item = 0
                 for i in entities:
@@ -650,7 +756,6 @@ def get_reply():
             reply = "Because these hotels have the best ratings, and also the best comments on the most important aspects for you, like " + pref_0 + " and " + pref_1 + ". "
             aspects_reply = [pref_0, pref_1]
 
-
         # Intention indefinite-non_comparative-factoid-aspect
         # e.g. Do any of the hotels offer complimentary breakfast
         if (scope == 'indefinite') & (comparison == 'non_comparative') & (assessment == 'factoid') & (detail == 'aspect'):
@@ -681,21 +786,30 @@ def get_reply():
                         reply = reply.replace('at, Hotel', 'at Hotel')
                     else:
                         reply = "No, according to our information, none."
-                elif ('which' in sentence_split) | ('what' in sentence_split):
+                elif ('bed' in sentence.lower()) & (('size' in sentence.lower()) | ('many' in sentence.lower())) :
+                    reply = "Double or twin bedded rooms. "
+                elif ('which' in sentence.lower()) | (('what' in sentence.lower()) & (not 'facilities' in sentence.lower())): # the facilities condition refers to questions like "What facilities are offered?"
                     if len(list_hotels_reply) > 0:
                         for i in list_hotels_reply:
                             reply = reply + 'Hotel ' + i + ', '
                     else:
                         reply = "According to our information, none."
+                    if (aspect == 'food') & ('type' in sentence.lower()):
+                        if not 'breakfast' in sentence.lower():
+                            reply = ''
+                        else:
+                            reply = 'Continental breakfast. '
+
+
             except Exception as e:
                 error_code = 100
                 raise ValueError('Error when getting reply indefinite-non_comparative-factoid-aspect: ' + str(e))
 
-        # Intention indefinite-comparative-subjective-aspect -----------------------------------------------
+        # Intention indefinite-comparative-evaluation-aspect -----------------------------------------------
         # e.g. which hotel has the best customer service?
-        # Intention indefinite - non_comparative - subjective - aspect
+        # Intention indefinite - non_comparative - evaluation - aspect
         # I just need a good hotel with a gloomy location /  what rooms would be good for parents with children
-        if (scope == 'indefinite') & (assessment == 'subjective') & (detail == 'aspect'):
+        if (scope == 'indefinite') & (assessment == 'evaluation') & (detail == 'aspect'):
             template_reply = [
                 "Hotel _hotel0_, given that  _per0_% of the comments about _asp0_ are positive. _per1_% of the comments of Hotel _hotel1_ are also positive.",
                 "Hotel _hotel0_, because  _per0_% of the comments about _asp0_ are positive. Hotel _hotel1_ also has positive comments about it (_per1_%).",
@@ -723,13 +837,13 @@ def get_reply():
                 error_code = 100
                 raise ValueError('Error when getting reply intention Comparison Indefinite - Evaluation - Aspect: ' + str(e))
 
-            # Intention Single - Subjective - Aspect ----------------------------------------------------------
+            # Intention Single - evaluation - Aspect ----------------------------------------------------------
             # e.g. How is the food at Hotel Evelyn?
 
-        # Intention single-non_comparative-subjective-aspect ----------------------------------------------------------------
+        # Intention single-non_comparative-evaluation-aspect ----------------------------------------------------------------
         # e.g. How is the food at Hotel Evelyn
-        #if (scope == 'single') & (comparison == 'non_comparative') & (assessment == 'subjective') & (detail == 'aspect'): #comparative has no relevance, answers the same when single
-        if (scope == 'single') & (assessment == 'subjective') & (detail == 'aspect'):
+        #if (scope == 'single') & (comparison == 'non_comparative') & (assessment == 'evaluation') & (detail == 'aspect'): #comparative has no relevance, answers the same when single
+        if (scope == 'single') & (assessment == 'evaluation') & (detail == 'aspect'):
             template_reply = [
                 "_per0_% of the comments about _asp0_ are positive.",
                 "Comments about _asp0_ are mostly positive (_per0_%).",
@@ -756,14 +870,14 @@ def get_reply():
                     error_code = 100
             except Exception as e:
                 error_code = 100
-                raise ValueError('Error when getting reply intention Single - Subjective - Aspect: ' + str(e))
+                raise ValueError('Error when getting reply intention Single - evaluation - Aspect: ' + str(e))
 
-        # Intention indefinite-comparative-subjective-overall ----------------------------------------------------------------
+        # Intention indefinite-comparative-evaluation-overall ----------------------------------------------------------------
         # e.g. which hotels have the best reviews / Which hotel is the best of these 5
-        # Intention indefinite - non_comparative - subjective - overall ( could be treated exactly as Intention indefinite-comparative-subjective-overall, very low frequency)
+        # Intention indefinite - non_comparative - evaluation - overall ( could be treated exactly as Intention indefinite-comparative-evaluation-overall, very low frequency)
         # what would be a good recomendation
         # we manage as well requests for most negative reviews.
-        if (scope == 'indefinite') & ((comparison == 'comparative') | (comparison == 'non_comparative')) & (assessment == 'subjective') & (detail == 'overall'):
+        if (scope == 'indefinite') & ((comparison == 'comparative') | (comparison == 'non_comparative')) & ((assessment == 'evaluation')|(assessment == 'factoid')) & (detail == 'overall'):
             # Templates
             template_reply = [
                 "Hotel _hotel1_ has the best reviews and ratings. _per1_% of the comments are positive. ",
@@ -771,7 +885,7 @@ def get_reply():
                 "Hotel _hotel1_, based on the ratings and mostly positive comments reported (about _per1_% of positive comments). ",
             ]
             negative = False
-            if (comparison == 'comparative') & (('worst' in sentence) | ('most negative' in sentence)):
+            if (comparison == 'comparative') & (('worst' in sentence) | ('most negative' in sentence) | ('not recommend' in sentence)):
                 negative = True
                 template_reply_neg = "Hotel _hotel1_ has the highest rate of negative reviews. _per1_% of the reported comments are negative. "
             try:
@@ -806,17 +920,19 @@ def get_reply():
                 reply = reply.replace('_hotel1_', hotel_1).replace('_per1_', percentage_1)
             except Exception as e:
                 error_code = 100
-                raise ValueError('Error when getting reply intention indefinite-comparative-subjective-overall: ' + str(e))
+                raise ValueError('Error when getting reply intention indefinite-comparative-evaluation-overall: ' + str(e))
 
-        # Intention tuple - comparative - subjective - overall
+        # Intention tuple - comparative - evaluation - overall
         # what is difference between hotel evelyn and hotel james
-        # Intention 'tuple - comparative - why-recommended - overall' will be handled equal to 'tuple - comparative - subjective - overall'
+        # Intention 'tuple - comparative - why-recommended - overall' will be handled equal to 'tuple - comparative - evaluation - overall'
         # e.g. Why is it better than Hotel Riley
         # Intention tuple - comparative - why-recommended - aspect
         # e.g. Why is Julian location better than Hotel Riley
-        if (scope == 'tuple') & (comparison == 'comparative') & ((assessment == 'subjective') | (assessment == 'why-recommended')):
+
+        if (scope == 'tuple') & (comparison == 'comparative') & ((assessment == 'evaluation') | (assessment == 'why-recommended')):
             #& (detail == 'overall')
             #& (detail == 'aspect')
+
             try:
                 reply = ""
                 if len(entities) > 1:
@@ -862,25 +978,31 @@ def get_reply():
                         if (len(better_h1) == 0) | (len(better_h2) == 0):
                             reply = 'Hotel ' + best_hotel + ' has better comments about the most important aspects to you (' + str(preferences) + ')'
                             reply = reply.replace('[', '').replace(']', '').replace('\'', '')
+                            entities_reply = [best_hotel]
                         else:
                             if len(better_h1) > len(better_h2):
                                 reply = 'Hotel _hotel1_ has better comments on the aspects that are most important to you (' + str(better_h1) + '). However, Hotel _hotel2_ has better comments about ' + str(better_h2) + '.'
+                                entities_reply = [hotel_1, hotel_2]
                             elif len(better_h1) < len(better_h2):
                                 reply = '_hotel2_ has better comments on the aspects that are most important to you (' + str(better_h2) + '). However _hotel1_ has better comments about ' + str(better_h1) + '.'
+                                entities_reply = [hotel_2, hotel_1]
                             reply = reply.replace('_hotel1_', hotel_1).replace('_hotel2_',hotel_2).replace('[','').replace(']','').replace('\'','')
+
+
                     else:
                         reply = 'Hotel ' + best_hotel + ' has better comments about '+ aspect + ' ('+str(quality_pref_df[quality_pref_df.hotel==best_hotel]['per_positive'].values[0]) + '% of positive comments)'
+                        entities_reply = [best_hotel]
                         # TODO: e.g. why is hotel evelyn a 4 star hotel priced higher than hotel owen a 5star hotel
                 else:
                     error_code = 102
             except Exception as e:
                 error_code = 100
-                raise ValueError('Error when getting reply intention tuple - comparative - subjective - overall: ' + str(e))
+                raise ValueError('Error when getting reply intention tuple - comparative - evaluation - overall: ' + str(e))
 
         # From here, only intentions with very low frequency ------------------
-        # single - comparative - subjective - overall
+        # single - comparative - evaluation - overall
         # e.g. What did people like the most about Hotel Emily
-        if (scope == 'single') & (comparison == 'comparative') & (assessment == 'subjective') & (detail == 'overall'):
+        if (scope == 'single') & (comparison == 'comparative') & (assessment == 'evaluation') & (detail == 'overall'):
             hotel_id = ''
             if len(entities) > 0:  # Get hotel id
                 hotel_name = entities[0]
@@ -898,6 +1020,43 @@ def get_reply():
                 if (len(quality)>0):
                     reply = quality[0][1] + " and " + quality[1][1] + ", given that " + str(quality[0][0]) + "% of comments on " + quality[0][1] + " are positive, while " + str(quality[1][0]) + "% of comments on " + quality[1][1] + " are positive"
                     aspects_reply = [quality[0][1], quality[1][1]]
+
+        # single - non-comparative - evaluation - overall
+        # e.g. how good is hotel emily? is it a good option?
+        # special case, what is bad about hotel x?
+        if (scope == 'single') & (comparison == 'non_comparative') & (assessment == 'evaluation') & (detail == 'overall'):
+            hotel_id = ''
+            negative = False
+            if ('bad' in sentence.lower()) | ('worst' in sentence.lower()) | ('dislike' in sentence.lower()) | ('didn\'t like' in sentence.lower()) | ('don\'t like' in sentence.lower()):
+                negative = True
+            if len(entities) > 0:  # Get hotel id
+                hotel_name = entities[0]
+                if len(entities) == 2:
+                    hotel_name = entities[1]
+                hotel_name = hotel_name.split()[-1]
+                hotel_name = hotel_name.title()
+                hotels = db.session.query(Hotels.hotelID, Hotels.name).filter(Hotels.name == hotel_name).all()
+                if len(hotels) > 0:
+                    hotel_id = hotels[0][0]
+
+                if not negative:
+                    # Get quality for aspects and hotel
+                    quality = db.session.query(Aspects_hotels.per_positive, Aspects_hotels.aspect).filter(Aspects_hotels.hotelID == hotel_id). \
+                            order_by(desc(Aspects_hotels.per_positive)). \
+                            all()
+                    if (len(quality)>0):
+
+                        aspects_reply = [quality[0][1], quality[1][1]]
+                        reply = "Customers reported positive comments about it, particularly:"+ str(quality[0][0]) + "% of comments on " + quality[0][1] + " are positive, while " + str(quality[1][0]) + "% of comments on " + quality[1][1] + " are positive"
+                else:
+                    # Get quality for aspects and hotel
+                    quality = db.session.query(Aspects_hotels.per_positive, Aspects_hotels.aspect).filter(
+                        Aspects_hotels.hotelID == hotel_id). \
+                        order_by(Aspects_hotels.per_positive). \
+                        all()
+                    if (len(quality) > 0):
+                        aspects_reply = [quality[0][1], quality[1][1]]
+                        reply = "Customers reported some negative comments, especially: " + str(100 - round(quality[0][0])) + "% of comments on " + quality[0][1] + " are negative, while " + str(100 - round(quality[1][0])) + "% of comments on " + quality[1][1] + " are negative"
 
         # Intention indefinite - comparative - factoid - aspect
         # which the nearest hotel to a station
@@ -937,6 +1096,27 @@ def get_reply():
             if len(hotels) > 0:
                 reply = 'Hotel ' + hotels[0][0] + ' ($' + str(hotels[0][1]) + ')'
 
+        # Intention single	comparative	factoid	aspect, aspect price
+        # e.g.: What is the cheapest price for a room in Hotel Emily?
+        if (scope == 'single') & (assessment == 'factoid') & (comparison == 'comparative') & (detail == 'aspect') & (aspect == 'price'):
+            try:
+                hotel_id = ''
+                if len(entities) > 0:  # Get hotel id
+                    hotel_name = entities[0]
+                    hotel_name = hotel_name.split()[-1]
+                    hotel_name = hotel_name.title()
+                    hotels = db.session.query(Hotels.hotelID, Hotels.price).filter(Hotels.name == hotel_name).all()
+                    if len(hotels) > 0:
+                        reply = 'It is $' + str(hotels[0][1]) + '.'
+                else:
+                    error_code = 100
+                if 'why' in sentence.lower(): # e.g. Why is Hotel Amelia the cheapest?
+                    reply = 'The hotel is currently offering special deals.'
+
+            except Exception as e:
+                error_code = 100
+                raise ValueError('Error when getting reply single	comparative	factoid	aspect, aspect price: ' + str(e))
+
     except ValueError as err:
         error_description = err.message
     except Exception as e:
@@ -945,19 +1125,24 @@ def get_reply():
     finally:
         db.session.close()
 
+    # If reply contains aspect "check-in"
+    reply = reply.replace('checking','check-in')
+
     error = {}
     if error_code == 100:
         error = {'error_code': 100,'error_description': error_description}
     if (error_code == 101) | (reply == ''):
         error_description = 'I am sorry, I do not have enough information to reply to this question.'
         if (not scope is None) & (not assessment is None):
-            if (scope == 'indefinite') & (assessment == 'factoid'):
+            if (scope == 'indefinite') & ((assessment == 'factoid') | (assessment == 'why-recommended')):
                 error_description = 'I am sorry, I do not have enough information to reply to this question. Could you please rephrase it, indicating for which hotel you need this information?'
         error = {'error_code': 101, 'error_description': error_description}
     if (error_code == 102) :
         error = {'error_code': 102, 'error_description':'Could you please indicate the name of the hotel for which you would like information?'}
     if (error_code == 103) :
         error = {'error_code': 103, 'error_description':'Please indicate the aspects of most importance to you.'}
+    if (error_code == 104) :
+        error = {'error_code': 104, 'error_description':'I am unable to find an answer, could you please try to rephrase your question?'}
 
     # Log request
     try:
@@ -976,10 +1161,18 @@ def get_reply():
         print('Error logging: ' + str(e))
         traceback.print_exc()
 
+    # complete names of hotels, in case they are incomplete:
+    entities_reply_comp = []
+    for i in entities_reply:
+        if 'Hotel ' not in i:
+            entities_reply_comp.append('Hotel ' + i)
+        else:
+            entities_reply_comp.append(i)
+
     if (len(error) > 0) & (not aspect == 'reply_assessment') :
         return jsonify(error)
     if not sentence is None:
-        return jsonify({'reply': reply, 'similar_user': similar_user, 'feature': feature, 'aspects_reply': aspects_reply, 'entities_reply': entities_reply})
+        return jsonify({'reply': reply, 'similar_user': similar_user, 'feature': feature, 'aspects_reply': aspects_reply, 'entities_reply': entities_reply_comp})
     else:
         return jsonify({'error_code': 104, 'error_description': 'A question is required.'})
 
@@ -1211,6 +1404,96 @@ def log_message():
             traceback.print_exc()
             return jsonify({'error': str(e)})  # returns list of hotels
     return jsonify({'log': 'registered'})  # returns list of hotels
+
+@app.route('/ExplainableRS/TestMsv/', methods=['GET'])
+@auth.login_required
+def get_reply_msv():
+    if not request.json or not 'sentence' in request.json:
+        abort(400)
+    sentence = request.json['sentence']
+    if sentence == 'all':
+        count = 0
+        sentences = pd.read_csv('C:\Python\ConversationalRS\data\DataTrainingFinalModels\GS_for_training_ext_detail.tsv', sep='\t')
+        sentences =  sentences.ix[random.sample(list(sentences.index), 100)]
+        # create random index
+        #rindex = np.array(random.sample(xrange(len(sentences)), 10))
+
+        # get 10 random rows from df
+        #sentences = sentences.ix[rindex]
+
+        for i, row in sentences.iterrows():
+            count = count + 1
+            #if count < 3:
+            if True:
+                sentence = row['question']
+                # Process question
+                question = ''
+                try:
+                 question = sentence
+                 reply = ''
+
+                 response = requests.get(intention_endpoint,
+                                         json={"sentence": question, "entities_old": []},
+                                         auth=(her_username, her_password))
+                 # print(response.status_code)
+                 if not response:  # or not 'hotels' in request.json:
+                     print('error 400')
+                 if 'error' in response.json():
+                     print("Error getting intention:" + response.json().get("error"))
+
+                 if (not response is None) & (not response.json() is None):
+                     aspect = assessment = comparison = detail = scope = ''
+                     entities = []
+                     if 'aspect' in response.json():
+                         aspect = response.json().get('aspect')
+                     if 'entities' in response.json():
+                         entities = response.json().get('entities')
+                     else:
+                         entities = []
+                     if 'intention' in response.json():
+                         intention = response.json().get('intention')
+                         assessment = intention.get('assessment')
+                         comparison = intention.get('comparison')
+                         detail = intention.get('detail')
+                         scope = intention.get('scope')
+                         entities_aux = ''
+                         for i in entities:
+                             entities_aux = entities_aux + '-' + i
+                         # print(aspect +'-'+ assessment +'-'+ comparison +'-'+ detail +'-'+ scope)
+
+                         json_req = {"userID": 160, "similar_user": 160, "sentence": question, "aspect": aspect,
+                                     "entities": entities, "preferences": [],
+                                     "intention": {"scope": scope, "comparison": comparison,
+                                                   "assessment": assessment,
+                                                   "detail": detail},
+                                     "intention_type": "domain"}
+
+                         # print(json_req)
+                         response = requests.get(reply_endpoint, json=json_req, auth=(her_username, her_password))
+                         # print(response.status_code)
+                         if not response:  # or not 'hotels' in request.json:
+                             print('error 400')
+                         if 'error' in response.json():
+                             print("Error getting reply:" + response.json().get("error"))
+                         if 'error_description' in response.json():
+                             reply = response.json().get("error_description")
+                         # print(response)
+                         if (not response is None) & (not response.json() is None):
+                             if 'reply' in response.json():
+                                 reply = response.json().get('reply')
+                         # print(reply)
+                         #message = 'ID: '+ str(row['id_question']) + '; QUESTION:' + sentence+ '; INTENT: ' + str(intention) + '; REPLY:' + reply
+                         message =  str(row['id_question']) + ';' + sentence + ';' + str(intention) + ';' + reply
+                         print(message)
+
+
+                except Exception as e:
+                    print('Error:')
+                    print(e)
+                    traceback.print_exc()
+
+    return jsonify({'log': 'ok'})
+
 
 if __name__ == '__main__':
     app.run(debug=True)
